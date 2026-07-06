@@ -1,540 +1,492 @@
 const { app, action, core } = require("photoshop");
-const { storage, formats } = require("uxp").storage;
+const { storage } = require("uxp").storage;
 const fs = require("uxp").storage.localFileSystem;
 
-let selectedFile = null;
+const DESCRIPTOR_JSON_PATH = "parsed_neural_output.json";
+const SUPPORTED_IMAGE_EXTENSIONS = new Set([
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".psd",
+    ".psb",
+    ".webp"
+]);
 
-// Add notification listener to capture neural filter commands
-// This will log the actual batchPlay commands when you manually run the filter
+const STYLE_ALIASES = {
+    "ast-hokusai": ["ast-hokusai"],
+    "wave": ["wave", "wave_2048", "wave_1024"],
+    "wave_2048": ["wave_2048", "wave"],
+    "wave_1024": ["wave_1024", "wave"]
+};
+
+let inputFolder = null;
+let outputFolder = null;
+let shouldCancel = false;
+let descriptorCache = null;
+
+// Keep this listener enabled so a fresh executable Neural Filter descriptor can be captured.
 action.addNotificationListener(["neuralGalleryFilters", "invokeCommand"], (event, descriptor) => {
-    console.log("Event:", event);
-    console.log("Descriptor:", JSON.stringify(descriptor, null, 2));
+    console.log("Neural filter event:", event);
+    console.log("Neural filter descriptor:", JSON.stringify(descriptor, null, 2));
 });
 
-// Initialize UI
 document.addEventListener("DOMContentLoaded", () => {
-    document.getElementById("select-file-btn").addEventListener("click", selectFile);
-    document.getElementById("process-btn").addEventListener("click", () => {
-        core.executeAsModal(processImage, { commandName: "JPEG 5000 Process" });
+    document.getElementById("select-input-folder-btn").addEventListener("click", selectInputFolder);
+    document.getElementById("select-output-folder-btn").addEventListener("click", selectOutputFolder);
+    document.getElementById("process-folder-btn").addEventListener("click", () => {
+        core.executeAsModal(processFolder, { commandName: "JPEG 5000 Batch Style Transfer" });
     });
-    document.getElementById("continue-btn").addEventListener("click", () => {
-        core.executeAsModal(continueFromSelectedLayer, { commandName: "JPEG 5000 Continue" });
-    });
-    document.getElementById("export-layers-btn").addEventListener("click", () => {
-        core.executeAsModal(exportLayersToFolder, { commandName: "JPEG 5000 Export Layers" });
-    });
-    document.getElementById("create-timeline-btn").addEventListener("click", () => {
-        core.executeAsModal(createFrameAnimation, { commandName: "JPEG 5000 Create Animation" });
+    document.getElementById("cancel-btn").addEventListener("click", () => {
+        shouldCancel = true;
+        updateProgressText("Cancel requested. Current image will finish first...");
     });
 });
 
-async function selectFile() {
+async function selectInputFolder() {
     try {
-        const file = await fs.getFileForOpening({ types: formats.images });
-        if (file) {
-            selectedFile = file;
-            document.getElementById("selected-file").textContent = file.name;
+        const folder = await fs.getFolder();
+        if (!folder) {
+            return;
         }
+        inputFolder = folder;
+        document.getElementById("input-folder-name").textContent = folder.nativePath || folder.name;
+        showResult(`Input folder selected: ${folder.name}`, false);
     } catch (error) {
-        console.error("Error selecting file:", error);
-        showError("Failed to select file: " + error.message);
+        showError("Failed to select input folder: " + error.message);
     }
 }
 
-async function processImage() {
-    if (!selectedFile) {
-        showError("Please select an image file first");
-        return;
-    }
-
-    const iterations = parseInt(document.getElementById("iterations").value);
-    const strength = document.getElementById("strength").value;
-
-    if (isNaN(iterations) || iterations < 1 || iterations > 5000) {
-        showError("Please enter a valid number of iterations (1-5000)");
-        return;
-    }
-
-    // Show progress section
-    document.getElementById("progress-section").classList.remove("hidden");
-    document.getElementById("result-section").classList.add("hidden");
-    document.getElementById("process-btn").disabled = true;
-
+async function selectOutputFolder() {
     try {
-        // Open the selected file
-        updateProgress(0, iterations + 1, "Opening image...");
-        console.log("Opening image:", selectedFile.name);
-        await openFile(selectedFile);
-        console.log("Image opened successfully");
-
-        await sleep(1000); // Wait for image to fully load
-
-        // Apply the JPEG Artifact Removal filter multiple times
-        for (let i = 0; i < iterations; i++) {
-            const currentIteration = i + 1;
-            console.log(`\n=== Starting iteration ${currentIteration} of ${iterations} ===`);
-
-            updateProgress(currentIteration, iterations + 1, `Iteration ${currentIteration}/${iterations}: Selecting layer...`);
-
-            // Select the topmost layer (the result from the previous iteration)
-            await selectTopLayer();
-            console.log(`Selected top layer for iteration ${currentIteration}`);
-
-            updateProgress(currentIteration, iterations + 1, `Iteration ${currentIteration}/${iterations}: Applying neural filter...`);
-            console.log(`Applying JPEG Artifact Removal filter (iteration ${currentIteration})...`);
-
-            await applyJPEGArtifactRemoval(strength);
-
-            console.log(`Filter applied successfully (iteration ${currentIteration})`);
-            updateProgress(currentIteration, iterations + 1, `Iteration ${currentIteration}/${iterations}: Processing complete, waiting...`);
-
-            // Wait for the filter to fully complete and the new layer to be created
-            await sleep(2000);
+        const folder = await fs.getFolder();
+        if (!folder) {
+            return;
         }
-
-        updateProgress(iterations + 1, iterations + 1, "Complete!");
-        console.log("\n=== All iterations complete! ===");
-        showResult(`Successfully applied JPEG Artifact Removal ${iterations} time(s)`);
-
+        outputFolder = folder;
+        document.getElementById("output-folder-name").textContent = folder.nativePath || folder.name;
+        showResult(`Output folder selected: ${folder.name}`, false);
     } catch (error) {
-        console.error("Error processing image:", error);
-        showError("Processing failed: " + error.message);
-    } finally {
-        document.getElementById("process-btn").disabled = false;
+        showError("Failed to select output folder: " + error.message);
     }
 }
 
-async function continueFromSelectedLayer() {
-    if (!app.activeDocument) {
-        showError("No active document. Please open a document with layers first.");
+async function processFolder() {
+    if (!inputFolder) {
+        showError("Choose an input folder first.");
+        return;
+    }
+    if (!outputFolder) {
+        showError("Choose an output folder first.");
         return;
     }
 
-    const iterations = parseInt(document.getElementById("iterations").value);
-    const strength = document.getElementById("strength").value;
+    const styleName = document.getElementById("style-select").value;
+    const processButton = document.getElementById("process-folder-btn");
+    const cancelButton = document.getElementById("cancel-btn");
+    const results = [];
 
-    if (isNaN(iterations) || iterations < 1 || iterations > 5000) {
-        showError("Please enter a valid number of iterations (1-5000)");
-        return;
-    }
-
-    // Show progress section
-    document.getElementById("progress-section").classList.remove("hidden");
-    document.getElementById("result-section").classList.add("hidden");
-    document.getElementById("continue-btn").disabled = true;
+    shouldCancel = false;
+    processButton.disabled = true;
+    cancelButton.disabled = false;
+    showProgress();
 
     try {
-        const doc = app.activeDocument;
-        const activeLayer = doc.activeLayers[0];
+        updateProgress(0, 100, "Loading Style Transfer descriptor data...");
+        await loadDescriptorData();
 
-        if (!activeLayer) {
-            showError("No layer selected. Please select a layer in the Layers panel.");
+        const imageFiles = await getImageFiles(inputFolder);
+        if (imageFiles.length === 0) {
+            showError("No supported images found in the input folder.");
             return;
         }
 
-        console.log(`Continuing from layer: ${activeLayer.name}`);
+        for (let i = 0; i < imageFiles.length; i++) {
+            if (shouldCancel) {
+                results.push({ name: "Batch", ok: false, error: "Cancelled by user" });
+                break;
+            }
 
-        // Make sure the selected layer is visible
-        if (!activeLayer.visible) {
-            console.log(`Selected layer was hidden, making it visible`);
-            activeLayer.visible = true;
+            const file = imageFiles[i];
+            const current = i + 1;
+            updateProgress(current - 1, imageFiles.length, `Opening ${file.name} (${current}/${imageFiles.length})...`);
+
+            try {
+                await processOneFile(file, styleName, current, imageFiles.length);
+                results.push({ name: file.name, ok: true });
+            } catch (error) {
+                console.error(`Failed processing ${file.name}:`, error);
+                results.push({ name: file.name, ok: false, error: error.message });
+                await closeActiveDocumentNoSave().catch(closeError => console.warn("Close after failure failed:", closeError));
+            }
         }
 
-        let startingLayerNumber = 0;
-
-        // Extract layer number from name if it follows the pattern "Layer X"
-        const layerNameMatch = activeLayer.name.match(/Layer (\d+)/);
-        if (layerNameMatch) {
-            startingLayerNumber = parseInt(layerNameMatch[1]);
-            console.log(`Detected starting layer number: ${startingLayerNumber}`);
-        }
-
-        updateProgress(0, iterations, `Continuing from ${activeLayer.name}...`);
-        await sleep(500);
-
-        // Apply the JPEG Artifact Removal filter multiple times
-        for (let i = 0; i < iterations; i++) {
-            const currentIteration = i + 1;
-            const expectedLayerNumber = startingLayerNumber + currentIteration;
-            console.log(`\n=== Starting iteration ${currentIteration} of ${iterations} ===`);
-
-            updateProgress(currentIteration, iterations + 1, `Iteration ${currentIteration}/${iterations}: Selecting layer...`);
-
-            // Select the topmost layer (the result from the previous iteration)
-            await selectTopLayer();
-            console.log(`Selected top layer for iteration ${currentIteration}`);
-
-            updateProgress(currentIteration, iterations + 1, `Iteration ${currentIteration}/${iterations}: Applying neural filter...`);
-            console.log(`Applying JPEG Artifact Removal filter (iteration ${currentIteration})...`);
-
-            await applyJPEGArtifactRemoval(strength);
-
-            console.log(`Filter applied successfully (iteration ${currentIteration})`);
-            console.log(`Expected new layer: Layer ${expectedLayerNumber}`);
-            updateProgress(currentIteration, iterations + 1, `Iteration ${currentIteration}/${iterations}: Processing complete, waiting...`);
-
-            // Wait for the filter to fully complete and the new layer to be created
-            await sleep(2000);
-        }
-
-        updateProgress(iterations + 1, iterations + 1, "Complete!");
-        console.log("\n=== All iterations complete! ===");
-        showResult(`Successfully applied JPEG Artifact Removal ${iterations} time(s) from ${activeLayer.name}`);
-
+        updateProgress(imageFiles.length, imageFiles.length, "Batch complete.");
+        showBatchSummary(results);
     } catch (error) {
-        console.error("Error continuing from layer:", error);
-        showError("Processing failed: " + error.message);
+        console.error("Batch processing failed:", error);
+        showError("Batch failed: " + error.message);
     } finally {
-        document.getElementById("continue-btn").disabled = false;
+        processButton.disabled = false;
+        cancelButton.disabled = true;
     }
+}
+
+async function processOneFile(file, styleName, current, total) {
+    await openFile(file);
+    await sleep(700);
+
+    updateProgress(current - 0.75, total, `Selecting subject in ${file.name}...`);
+    await selectSubject();
+    await sleep(300);
+
+    updateProgress(current - 0.5, total, `Applying Style Transfer (${styleName}) to ${file.name}...`);
+    await applyStyleTransfer(styleName);
+    await sleep(1200);
+
+    updateProgress(current - 0.25, total, `Saving ${file.name}...`);
+    await saveActiveDocumentAsPng(outputFolder, makeOutputName(file.name));
+    await closeActiveDocumentNoSave();
+}
+
+async function getImageFiles(folder) {
+    const entries = await folder.getEntries();
+    return entries
+        .filter(entry => entry.isFile && SUPPORTED_IMAGE_EXTENSIONS.has(getExtension(entry.name)))
+        .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 async function openFile(file) {
     const token = await fs.createSessionToken(file);
-
     await action.batchPlay([
         {
-            "_obj": "open",
-            "target": {
-                "_path": token,
-                "_kind": "local"
+            _obj: "open",
+            target: {
+                _path: token,
+                _kind: "local"
             }
         }
-    ], {
-        modalBehavior: "execute"
-    });
+    ], { modalBehavior: "execute" });
 }
 
-async function selectTopLayer() {
-    // Select the topmost layer in the document
-    await action.batchPlay([
-        {
-            "_obj": "select",
-            "_target": [
-                {
-                    "_ref": "layer",
-                    "_enum": "ordinal",
-                    "_value": "targetEnum"
-                }
-            ],
-            "makeVisible": false
+async function selectSubject() {
+    const attempts = [
+        [{ _obj: "autoCutout", sampleAllLayers: false }],
+        [{ _obj: "autoCutout", sampleAllLayers: true }],
+        [{ _obj: "set", _target: [{ _ref: "channel", _property: "selection" }], to: { _enum: "ordinal", _value: "subject" } }]
+    ];
+
+    let lastError = null;
+    for (const descriptor of attempts) {
+        try {
+            await action.batchPlay(descriptor, { modalBehavior: "execute" });
+            return;
+        } catch (error) {
+            lastError = error;
+            console.warn("Select Subject attempt failed:", error.message);
         }
-    ], {
-        modalBehavior: "execute"
-    });
+    }
+
+    throw new Error("Select Subject failed. Run Select > Subject once manually and capture the batchPlay command if this Photoshop version uses a different descriptor. Last error: " + (lastError ? lastError.message : "unknown"));
 }
 
-async function applyJPEGArtifactRemoval(strength = "high") {
-    // This is the actual batchPlay descriptor captured from Photoshop
-    // NF_OUTPUT_TYPE: 2 = New Layer, 1 = Current Layer
-    const descriptor = {
-        "NF_OUTPUT_TYPE": 2,  // Create new layer
-        "NF_SPL_GRAPH": {"spl::edges":[{"spl::ID":5309,"spl::bottom":"convertType","spl::top":"senseiModel","spl::variable":{"spl::ID":5309,"spl::type":"image"}},{"spl::ID":5299,"spl::bottom":"senseiModel","spl::top":"convertType","spl::variable":{"spl::ID":5299,"spl::type":"image"}},{"spl::ID":4210,"spl::bottom":"convertType","spl::label":"NF_INPUT","spl::top":"head","spl::variable":{"spl::ID":4210,"spl::type":"image"}},{"spl::ID":5315,"spl::bottom":"tail","spl::label":"graph_output","spl::top":"convertType","spl::variable":{"spl::ID":5315,"spl::type":"image"}}],"spl::graphRevision":1,"spl::nodes":[{"spl::label":"head","spl::operation":"head","spl::outEdges":[{"spl::link":4210}]},{"spl::inEdges":[{"spl::link":4210}],"spl::inputs":{"spl::input":{"spl::ID":4210,"spl::type":"image"}},"spl::label":"convertType","spl::operation":"convertType","spl::outEdges":[{"spl::link":5299}],"spl::outputs":{"spl::output":{"spl::ID":5299,"spl::type":"image"}},"spl::params":{"spl::alpha":{"spl::ID":5297,"spl::type":"scalar","spl::value":0.00392156862745098},"spl::beta":{"spl::ID":5298,"spl::type":"scalar","spl::value":0.0},"spl::type":{"spl::ID":5296,"spl::type":"scalar","spl::value":2.0}}},{"spl::inEdges":[{"spl::link":5299}],"spl::inputs":{"spl::input":{"spl::ID":5299,"spl::type":"image"}},"spl::label":"senseiModel","spl::operation":"senseiModel","spl::outEdges":[{"spl::link":5309}],"spl::outputs":{"spl::output":{"spl::ID":5309,"spl::type":"image"}},"spl::params":{"spl::modelDeviceType":{"spl::ID":5305,"spl::type":"string","spl::value":"cpu"},"spl::modelID":{"spl::ID":5302,"spl::type":"string","spl::value":"JpegRemoval-3"},"spl::modelSkipWarmup":{"spl::ID":5306,"spl::type":"scalar","spl::value":1.0},"spl::tileOverlap":{"spl::ID":5304,"spl::type":"scalar","spl::value":30.0},"spl::tiled":{"spl::ID":5303,"spl::type":"scalar","spl::value":1.0}}},{"spl::inEdges":[{"spl::link":5309}],"spl::inputs":{"spl::input":{"spl::ID":5309,"spl::type":"image"}},"spl::label":"convertType","spl::operation":"convertType","spl::outEdges":[{"spl::link":5315}],"spl::outputs":{"spl::output":{"spl::ID":5315,"spl::type":"image"}},"spl::params":{"spl::alpha":{"spl::ID":5313,"spl::type":"scalar","spl::value":255.0},"spl::beta":{"spl::ID":5314,"spl::type":"scalar","spl::value":0.0},"spl::type":{"spl::ID":5312,"spl::type":"scalar","spl::value":0.0}}},{"spl::inEdges":[{"spl::link":5315}],"spl::label":"tail","spl::operation":"tail"}],"spl::params":[],"spl::variable":{},"spl::version":"1.0.0"},
-        "NF_SPL_REGISTERED_VARIABLES": ["StyleGan2Cloud/pt_iter3_surprise.dat","StyleGan2Cloud/pt_iter3_happy.dat","StyleGan2Cloud/pt_iter3_gaze.dat","StyleGan2Cloud/pt_iter3_bald.dat","StyleGan2Cloud/pt_iter3_yaw.dat","StyleGan2Cloud/pt_iter3_lighting.dat","StyleGan2Cloud/pt_iter3_anger.dat","StyleGan2Cloud/pt_iter3_age.dat"],
-        "NF_SPL_REGISTERED_VAR_CONFIGS": [0,0,0,0,0,0,0,0],
-        "NF_SPL_REGISTERED_VAR_NAMES": ["genshop2_latentDirectionIter3_3","genshop2_latentDirectionIter3_2","genshop2_latentDirectionIter3_7","genshop2_latentDirectionIter3_1","genshop2_latentDirectionIter3_4","genshop2_latentDirectionIter3_6","genshop2_latentDirectionIter3_5","genshop2_latentDirectionIter3_0"],
-        "NF_SPL_SOURCE_MD5": {"_data":"hCTHvdh51x7cQkKYLuRiwg==","_rawData":"base64"},
-        "NF_UI_DATA": {"_obj":"NF_UI_DATA","spl::filterStack":[{"_obj":"spl::filterStack","spl::cropStates":[{"_obj":"spl::cropStates","spl::cropId":"layer1","spl::values":{"_obj":"spl::values","spl::factor":"JpegRemoval-3"}}],"spl::enabled":true,"spl::id":"internal.JpegArtefactsRemoval","spl::version":"1.0"}],"spl::version":"1.0.6"},
-        "NF_UI_DATA_MD5": "0C38196AF13933BE1F28B94082F1971A",
-        "_obj": "neuralGalleryFilters"
+async function applyStyleTransfer(styleName) {
+    const descriptor = buildStyleTransferDescriptor(styleName);
+    validateExecutableStyleTransferDescriptor(descriptor);
+    await action.batchPlay([descriptor], { modalBehavior: "execute" });
+}
+
+function buildStyleTransferDescriptor(styleName) {
+    const executableDescriptor = findExecutableDescriptor(styleName);
+    if (executableDescriptor) {
+        return tuneDescriptorForStyle(executableDescriptor, styleName);
+    }
+
+    const metadata = getStyleMetadata(styleName);
+    throw new Error([
+        `No executable Style Transfer batchPlay descriptor was found in ${DESCRIPTOR_JSON_PATH}.`,
+        `The JSON confirms Style Transfer metadata (${metadata.id || "internal.StyleTransfer"}, style=${metadata.style || styleName}), but Photoshop needs the full neuralGalleryFilters payload.`,
+        "Paste/export a captured descriptor object containing _obj, NF_SPL_GRAPH, NF_UI_DATA, NF_SPL_REGISTERED_VARIABLES, NF_SPL_REGISTERED_VAR_NAMES, and NF_SPL_REGISTERED_VAR_CONFIGS into parsed_neural_output.json."
+    ].join(" "));
+}
+
+async function loadDescriptorData() {
+    if (descriptorCache) {
+        return descriptorCache;
+    }
+
+    const response = await fetch(DESCRIPTOR_JSON_PATH);
+    if (!response.ok) {
+        throw new Error(`Could not load ${DESCRIPTOR_JSON_PATH}. Make sure it is in the plugin root.`);
+    }
+
+    descriptorCache = await response.json();
+    console.log("Loaded Style Transfer descriptor data", descriptorCache);
+    return descriptorCache;
+}
+
+function findExecutableDescriptor(styleName) {
+    const candidates = [];
+    walkObject(descriptorCache, value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+            return;
+        }
+
+        const isNeuralFilter = value._obj === "neuralGalleryFilters";
+        const hasExecutableKeys = value.NF_SPL_GRAPH && value.NF_UI_DATA;
+        if (isNeuralFilter && hasExecutableKeys && descriptorMentionsStyle(value, styleName)) {
+            candidates.push(value);
+        }
+    });
+
+    if (candidates.length > 0) {
+        return deepClone(candidates[0]);
+    }
+
+    walkObject(descriptorCache, value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+            return;
+        }
+        if (value._obj === "neuralGalleryFilters" && value.NF_SPL_GRAPH && value.NF_UI_DATA) {
+            candidates.push(value);
+        }
+    });
+
+    return candidates.length > 0 ? deepClone(candidates[0]) : null;
+}
+
+function validateExecutableStyleTransferDescriptor(descriptor) {
+    const requiredKeys = ["_obj", "NF_SPL_GRAPH", "NF_UI_DATA"];
+    const missing = requiredKeys.filter(key => !descriptor || !descriptor[key]);
+    if (missing.length > 0) {
+        throw new Error("Style Transfer descriptor is missing required keys: " + missing.join(", "));
+    }
+    if (descriptor._obj !== "neuralGalleryFilters") {
+        throw new Error("Style Transfer descriptor must have _obj: neuralGalleryFilters.");
+    }
+}
+
+function tuneDescriptorForStyle(descriptor, styleName) {
+    const aliases = STYLE_ALIASES[styleName] || [styleName];
+    const preferredModel = aliases[0];
+
+    walkObject(descriptor, value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+            return;
+        }
+
+        setIfPresent(value, "spl::style", styleName === "wave_2048" || styleName === "wave_1024" ? "wave" : styleName);
+        setIfPresent(value, "style", styleName === "wave_2048" || styleName === "wave_1024" ? "wave" : styleName);
+
+        if (value["spl::modelID"] && typeof value["spl::modelID"] === "string") {
+            value["spl::modelID"] = preferredModel;
+        }
+        if (value.modelID && typeof value.modelID === "string") {
+            value.modelID = preferredModel;
+        }
+        if (value["spl::value"] && aliases.some(alias => String(value["spl::value"]).includes(alias))) {
+            value["spl::value"] = preferredModel;
+        }
+    });
+
+    return descriptor;
+}
+
+function getStyleMetadata(styleName) {
+    const metadata = {
+        id: "internal.StyleTransfer",
+        operation: "STYLE_TRANSFER",
+        styleTransferOption: "style_transfer",
+        style: styleName
     };
 
-    await action.batchPlay([descriptor], {
-        modalBehavior: "execute"
+    walkObject(descriptorCache, value => {
+        if (typeof value !== "string") {
+            return;
+        }
+        if (value === "internal.StyleTransfer") {
+            metadata.id = value;
+        } else if (value === "STYLE_TRANSFER") {
+            metadata.operation = value;
+        } else if (value === "style_transfer") {
+            metadata.styleTransferOption = value;
+        } else if ((STYLE_ALIASES[styleName] || [styleName]).includes(value)) {
+            metadata.style = value;
+        }
     });
+
+    return metadata;
+}
+
+function descriptorMentionsStyle(descriptor, styleName) {
+    const aliases = STYLE_ALIASES[styleName] || [styleName];
+    let foundStyle = false;
+    let foundStyleTransfer = false;
+
+    walkObject(descriptor, value => {
+        if (typeof value !== "string") {
+            return;
+        }
+        if (aliases.includes(value)) {
+            foundStyle = true;
+        }
+        if (value === "internal.StyleTransfer" || value === "STYLE_TRANSFER" || value === "style_transfer") {
+            foundStyleTransfer = true;
+        }
+    });
+
+    return foundStyle || foundStyleTransfer;
+}
+
+async function saveActiveDocumentAsPng(folder, fileName) {
+    const outputFile = await folder.createFile(fileName, { overwrite: true });
+    const token = await fs.createSessionToken(outputFile);
+
+    await action.batchPlay([
+        {
+            _obj: "save",
+            as: {
+                _obj: "PNGFormat",
+                PNGInterlaceType: {
+                    _enum: "PNGInterlaceType",
+                    _value: "PNGInterlaceNone"
+                },
+                PNGFilter: {
+                    _enum: "PNGFilter",
+                    _value: "PNGFilterAdaptive"
+                },
+                compression: 6
+            },
+            in: {
+                _path: token,
+                _kind: "local"
+            },
+            copy: true,
+            lowerCase: true
+        }
+    ], { modalBehavior: "execute" });
+}
+
+async function closeActiveDocumentNoSave() {
+    if (!app.activeDocument) {
+        return;
+    }
+
+    await action.batchPlay([
+        {
+            _obj: "close",
+            saving: {
+                _enum: "yesNo",
+                _value: "no"
+            }
+        }
+    ], { modalBehavior: "execute" });
+}
+
+function setIfPresent(object, key, value) {
+    if (Object.prototype.hasOwnProperty.call(object, key)) {
+        object[key] = value;
+    }
+}
+
+function walkObject(value, visitor, seen = new Set()) {
+    if (!value || typeof value !== "object" || seen.has(value)) {
+        return;
+    }
+
+    seen.add(value);
+    visitor(value);
+
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            if (item && typeof item === "object") {
+                walkObject(item, visitor, seen);
+            } else {
+                visitor(item);
+            }
+        }
+        return;
+    }
+
+    for (const key of Object.keys(value)) {
+        const child = value[key];
+        if (child && typeof child === "object") {
+            walkObject(child, visitor, seen);
+        } else {
+            visitor(child);
+        }
+    }
+}
+
+function deepClone(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function getExtension(fileName) {
+    const dot = fileName.lastIndexOf(".");
+    return dot === -1 ? "" : fileName.slice(dot).toLowerCase();
+}
+
+function getBaseName(fileName) {
+    const dot = fileName.lastIndexOf(".");
+    return dot === -1 ? fileName : fileName.slice(0, dot);
+}
+
+function makeOutputName(fileName) {
+    return sanitizeFilename(getBaseName(fileName)) + ".png";
+}
+
+function sanitizeFilename(name) {
+    return name.replace(/[/\\?%*:|"<>]/g, "-").substring(0, 120) || "output";
 }
 
 function updateProgress(current, total, message) {
-    const percentage = (current / total) * 100;
+    const percentage = total <= 0 ? 0 : Math.max(0, Math.min(100, (current / total) * 100));
     document.getElementById("progress-fill").style.width = percentage + "%";
+    updateProgressText(message);
+}
+
+function updateProgressText(message) {
     document.getElementById("status-text").textContent = message;
 }
 
-function showResult(message) {
-    document.getElementById("result-section").classList.remove("hidden");
-    document.getElementById("result-text").textContent = message;
-    document.getElementById("progress-section").classList.add("hidden");
+function showProgress() {
+    document.getElementById("progress-section").classList.remove("hidden");
+    document.getElementById("result-section").classList.add("hidden");
+    document.getElementById("progress-fill").style.width = "0%";
+}
+
+function showResult(message, hideProgress = true) {
+    const resultSection = document.getElementById("result-section");
+    const resultText = document.getElementById("result-text");
+    resultSection.classList.remove("hidden");
+    resultText.textContent = message;
+    resultText.style.backgroundColor = "#2d7d46";
+    if (hideProgress) {
+        document.getElementById("progress-section").classList.add("hidden");
+    }
 }
 
 function showError(message) {
-    document.getElementById("result-section").classList.remove("hidden");
+    const resultSection = document.getElementById("result-section");
     const resultText = document.getElementById("result-text");
+    resultSection.classList.remove("hidden");
     resultText.textContent = "Error: " + message;
     resultText.style.backgroundColor = "#d13438";
     document.getElementById("progress-section").classList.add("hidden");
 }
 
+function showBatchSummary(results) {
+    const successes = results.filter(result => result.ok).length;
+    const failures = results.filter(result => !result.ok);
+    const failureText = failures.length > 0
+        ? " Failed: " + failures.map(result => `${result.name} (${result.error})`).join("; ")
+        : "";
+
+    showResult(`Batch complete. Saved ${successes} file(s) to ${outputFolder.name}.${failureText}`);
+}
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function exportLayersToFolder() {
-    try {
-        // Check if there's an active document
-        if (!app.activeDocument) {
-            showError("No active document. Please process an image first.");
-            return;
-        }
-
-        // Show progress
-        document.getElementById("progress-section").classList.remove("hidden");
-        document.getElementById("result-section").classList.add("hidden");
-        updateProgress(0, 1, "Selecting export folder...");
-
-        // Let user select output folder
-        const folder = await fs.getFolder();
-        if (!folder) {
-            document.getElementById("progress-section").classList.add("hidden");
-            return;
-        }
-
-        console.log("Exporting layers to:", folder.nativePath);
-
-        const doc = app.activeDocument;
-        const layers = doc.layers;
-        const totalLayers = layers.length;
-
-        updateProgress(0, totalLayers, `Exporting ${totalLayers} layers...`);
-
-        // Export each layer (in reverse order, so bottom layer = frame 0)
-        for (let i = totalLayers - 1; i >= 0; i--) {
-            const layer = layers[i];
-            const frameNumber = totalLayers - i - 1; // Bottom layer = 0, top layer = highest
-
-            console.log(`Exporting layer ${frameNumber + 1}/${totalLayers}: ${layer.name}`);
-
-            updateProgress(frameNumber, totalLayers, `Exporting frame ${frameNumber + 1}/${totalLayers}`);
-
-            // Select the layer
-            await selectLayerByIndex(i);
-
-            // Hide all layers except the current one
-            await hideAllLayersExcept(i);
-
-            // Export the visible layer as PNG with simple sequential naming
-            const fileName = `frame_${String(frameNumber).padStart(4, '0')}.png`;
-            const outputFile = await folder.createFile(fileName, { overwrite: true });
-            const token = await fs.createSessionToken(outputFile);
-
-            console.log(`Exporting to: ${fileName}`);
-            console.log(`Output path: ${outputFile.nativePath}`);
-
-            // Use Save As with PNG format
-            await action.batchPlay([
-                {
-                    "_obj": "save",
-                    "as": {
-                        "_obj": "PNGFormat",
-                        "PNGInterlaceType": {
-                            "_enum": "PNGInterlaceType",
-                            "_value": "PNGInterlaceNone"
-                        },
-                        "PNGFilter": {
-                            "_enum": "PNGFilter",
-                            "_value": "PNGFilterAdaptive"
-                        },
-                        "compression": 6
-                    },
-                    "in": {
-                        "_path": token,
-                        "_kind": "local"
-                    },
-                    "copy": true,
-                    "lowerCase": true
-                }
-            ], {
-                modalBehavior: "execute"
-            });
-
-            console.log(`Exported: ${fileName}`);
-        }
-
-        // Show all layers again
-        await showAllLayers();
-
-        updateProgress(totalLayers, totalLayers, "Export complete!");
-        showResult(`Successfully exported ${totalLayers} layers to ${folder.name}`);
-
-    } catch (error) {
-        console.error("Error exporting layers:", error);
-        showError("Export failed: " + error.message);
-    }
-}
-
-async function selectLayerByIndex(layerIndex) {
-    // Select layer by index (from top, 0-based)
-    await action.batchPlay([
-        {
-            "_obj": "select",
-            "_target": [
-                {
-                    "_ref": "layer",
-                    "_index": layerIndex
-                }
-            ],
-            "makeVisible": false
-        }
-    ], {
-        modalBehavior: "execute"
-    });
-}
-
-async function hideAllLayersExcept(layerIndex) {
-    const doc = app.activeDocument;
-    const layers = doc.layers;
-
-    for (let i = 0; i < layers.length; i++) {
-        const layer = layers[i];
-        if (i === layerIndex) {
-            layer.visible = true;
-        } else {
-            layer.visible = false;
-        }
-    }
-}
-
-async function showAllLayers() {
-    const doc = app.activeDocument;
-    const layers = doc.layers;
-
-    for (let i = 0; i < layers.length; i++) {
-        layers[i].visible = true;
-    }
-}
-
-function sanitizeFilename(name) {
-    // Remove invalid filename characters
-    return name.replace(/[/\\?%*:|"<>]/g, '-').substring(0, 50);
-}
-
-async function createFrameAnimation() {
-    try {
-        // Check if there's an active document
-        if (!app.activeDocument) {
-            showError("No active document. Please process an image first.");
-            return;
-        }
-
-        // Show progress
-        document.getElementById("progress-section").classList.remove("hidden");
-        document.getElementById("result-section").classList.add("hidden");
-        updateProgress(0, 100, "Preparing animation...");
-
-        console.log("Creating frame animation from layers");
-
-        const doc = app.activeDocument;
-        const totalLayers = doc.layers.length;
-
-        updateProgress(20, 100, "Opening Timeline panel...");
-
-        // Step 1: Show the Timeline panel (Window > Timeline)
-        try {
-            await action.batchPlay([
-                {
-                    "_obj": "show",
-                    "null": {
-                        "_ref": "animationClass"
-                    }
-                }
-            ], {
-                modalBehavior: "execute"
-            });
-            console.log("Timeline panel shown");
-        } catch (e) {
-            console.log("Timeline panel may already be visible:", e.message);
-        }
-
-        await sleep(500);
-
-        updateProgress(40, 100, "Clearing timeline...");
-
-        // Step 2: Delete the existing timeline/animation to reset it
-        try {
-            await action.batchPlay([
-                {
-                    "_obj": "delete",
-                    "_target": [
-                        {
-                            "_enum": "ordinal",
-                            "_ref": "animationClass"
-                        }
-                    ]
-                }
-            ], {
-                modalBehavior: "execute"
-            });
-            console.log("Deleted existing timeline");
-        } catch (e) {
-            console.log("No timeline to delete:", e.message);
-        }
-
-        await sleep(500);
-
-        updateProgress(60, 100, "Creating fresh frame animation...");
-
-        // Step 3: Create a new frame animation from scratch
-        try {
-            await action.batchPlay([
-                {
-                    "_obj": "makeFrameAnimation"
-                }
-            ], {
-                modalBehavior: "execute"
-            });
-            console.log("Created new frame animation");
-        } catch (e) {
-            console.log("Error creating frame animation:", e.message);
-        }
-
-        await sleep(500);
-
-        updateProgress(80, 100, "Converting all layers to frames...");
-
-        // Step 4: Convert ALL layers to frames (should now pick up all 30 layers)
-        await action.batchPlay([
-            {
-                "_obj": "animationFramesFromLayers"
-            }
-        ], {
-            modalBehavior: "execute"
-        });
-
-        console.log(`Converted all ${totalLayers} layers to frames`);
-        await sleep(500);
-
-        console.log(`Created ${totalLayers} frames from layers`);
-
-        updateProgress(90, 100, "Setting loop mode to forever...");
-
-        // Step 3: Set to loop forever
-        await action.batchPlay([
-            {
-                "_obj": "set",
-                "_target": [
-                    {
-                        "_ref": "property",
-                        "_property": "animationLoopMode"
-                    },
-                    {
-                        "_ref": "timeline"
-                    }
-                ],
-                "to": {
-                    "_enum": "animationLoopMode",
-                    "_value": "forever"
-                }
-            }
-        ], {
-            modalBehavior: "execute"
-        });
-
-        console.log(`Timeline animation complete: ${totalLayers} frames`);
-
-        updateProgress(100, 100, "Animation ready!");
-        showResult(`Timeline animation created with ${totalLayers} frames (loops forever). Check the Timeline panel to preview and export!`);
-
-    } catch (error) {
-        console.error("Error creating animation:", error);
-        showError("Animation creation failed: " + error.message);
-    }
 }

@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>JPEG 5000</title>
+    <title>JPEG 5000 Style Transfer</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -14,39 +14,37 @@
 ██   ██║██╔═══╝ ██╔══╝  ██║   ██║    ╚════██║████╔╝██║████╔╝██║████╔╝██║
 ╚█████╔╝██║     ███████╗╚██████╔╝    ███████║╚██████╔╝╚██████╔╝╚██████╔╝
  ╚════╝ ╚═╝     ╚══════╝ ╚═════╝     ╚══════╝ ╚═════╝  ╚═════╝  ╚═════╝</pre>
-            <p class="subtitle">Neural JPEG Artifact Destruction</p>
+            <p class="subtitle">Batch Select Subject + Neural Style Transfer</p>
         </div>
 
         <div class="section">
-            <label>Select Image:</label>
-            <sp-button id="select-file-btn" variant="primary">Browse...</sp-button>
-            <p id="selected-file" class="file-name">No file selected</p>
+            <label>Input Folder:</label>
+            <sp-button id="select-input-folder-btn" variant="primary">Choose Input Folder</sp-button>
+            <p id="input-folder-name" class="file-name">No input folder selected</p>
+        </div>
+
+        <div class="section">
+            <label>Output Folder:</label>
+            <sp-button id="select-output-folder-btn" variant="primary">Choose Output Folder</sp-button>
+            <p id="output-folder-name" class="file-name">No output folder selected</p>
         </div>
 
         <div class="section">
             <div class="form-row">
-                <label for="iterations">Iterations:</label>
-                <input type="text" id="iterations" value="3" placeholder="1-5000">
-            </div>
-            <div class="form-row">
-                <label for="strength">Strength:</label>
-                <select id="strength">
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high" selected>High</option>
+                <label for="style-select">Style:</label>
+                <select id="style-select">
+                    <option value="ast-hokusai">ast-hokusai</option>
+                    <option value="wave">wave</option>
+                    <option value="wave_2048">wave_2048</option>
+                    <option value="wave_1024">wave_1024</option>
                 </select>
             </div>
+            <p class="hint">Outputs are saved as PNG files using the source base filename.</p>
         </div>
 
         <div class="section">
-            <sp-button id="process-btn" variant="cta">Process Image</sp-button>
-            <sp-button id="continue-btn" variant="secondary">Continue from Selected Layer</sp-button>
-        </div>
-
-        <div class="section">
-            <label>Export & Animation:</label>
-            <sp-button id="export-layers-btn" variant="primary">Export Layers to Folder</sp-button>
-            <sp-button id="create-timeline-btn" variant="primary">Create Frame Animation</sp-button>
+            <sp-button id="process-folder-btn" variant="cta">Process Folder</sp-button>
+            <sp-button id="cancel-btn" variant="secondary" disabled>Cancel After Current Image</sp-button>
         </div>
 
         <div id="progress-section" class="section hidden">
