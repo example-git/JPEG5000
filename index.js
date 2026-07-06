@@ -1,17 +1,9 @@
 const { app, action, core } = require("photoshop");
-const { storage } = require("uxp").storage;
 const fs = require("uxp").storage.localFileSystem;
 
 const DESCRIPTOR_JSON_PATH = "parsed_neural_output.json";
 const SUPPORTED_IMAGE_EXTENSIONS = new Set([
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".tif",
-    ".tiff",
-    ".psd",
-    ".psb",
-    ".webp"
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd", ".psb", ".webp"
 ]);
 
 const STYLE_ALIASES = {
@@ -25,24 +17,45 @@ let inputFolder = null;
 let outputFolder = null;
 let shouldCancel = false;
 let descriptorCache = null;
+let descriptorLoadWarning = null;
 
-// Keep this listener enabled so a fresh executable Neural Filter descriptor can be captured.
-action.addNotificationListener(["neuralGalleryFilters", "invokeCommand"], (event, descriptor) => {
-    console.log("Neural filter event:", event);
-    console.log("Neural filter descriptor:", JSON.stringify(descriptor, null, 2));
+window.addEventListener("error", event => {
+    console.error("JPEG5000 window error:", event.message, event.filename, event.lineno, event.colno, event.error);
 });
 
+window.addEventListener("unhandledrejection", event => {
+    console.error("JPEG5000 unhandled rejection:", event.reason);
+});
+
+try {
+    action.addNotificationListener(["neuralGalleryFilters", "invokeCommand"], (event, descriptor) => {
+        console.log("Neural filter event:", event);
+        console.log("Neural filter descriptor:", JSON.stringify(descriptor, null, 2));
+    });
+} catch (error) {
+    console.warn("Neural filter listener registration failed:", error.message);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-    document.getElementById("select-input-folder-btn").addEventListener("click", selectInputFolder);
-    document.getElementById("select-output-folder-btn").addEventListener("click", selectOutputFolder);
-    document.getElementById("process-folder-btn").addEventListener("click", () => {
+    bindClick("select-input-folder-btn", selectInputFolder);
+    bindClick("select-output-folder-btn", selectOutputFolder);
+    bindClick("process-folder-btn", () => {
         core.executeAsModal(processFolder, { commandName: "JPEG 5000 Batch Style Transfer" });
     });
-    document.getElementById("cancel-btn").addEventListener("click", () => {
+    bindClick("cancel-btn", () => {
         shouldCancel = true;
         updateProgressText("Cancel requested. Current image will finish first...");
     });
 });
+
+function bindClick(id, handler) {
+    const element = document.getElementById(id);
+    if (!element) {
+        console.error(`Missing UI element: ${id}`);
+        return;
+    }
+    element.addEventListener("click", handler);
+}
 
 async function selectInputFolder() {
     try {
@@ -51,7 +64,7 @@ async function selectInputFolder() {
             return;
         }
         inputFolder = folder;
-        document.getElementById("input-folder-name").textContent = folder.nativePath || folder.name;
+        setText("input-folder-name", folder.nativePath || folder.name);
         showResult(`Input folder selected: ${folder.name}`, false);
     } catch (error) {
         showError("Failed to select input folder: " + error.message);
@@ -65,7 +78,7 @@ async function selectOutputFolder() {
             return;
         }
         outputFolder = folder;
-        document.getElementById("output-folder-name").textContent = folder.nativePath || folder.name;
+        setText("output-folder-name", folder.nativePath || folder.name);
         showResult(`Output folder selected: ${folder.name}`, false);
     } catch (error) {
         showError("Failed to select output folder: " + error.message);
@@ -104,7 +117,7 @@ async function processFolder() {
 
         for (let i = 0; i < imageFiles.length; i++) {
             if (shouldCancel) {
-                results.push({ name: "Batch", ok: false, error: "Cancelled by user" });
+                results.push({ name: "Batch", ok: false, warning: "Cancelled by user" });
                 break;
             }
 
@@ -113,11 +126,11 @@ async function processFolder() {
             updateProgress(current - 1, imageFiles.length, `Opening ${file.name} (${current}/${imageFiles.length})...`);
 
             try {
-                await processOneFile(file, styleName, current, imageFiles.length);
-                results.push({ name: file.name, ok: true });
+                const warning = await processOneFile(file, styleName, current, imageFiles.length);
+                results.push({ name: file.name, ok: true, warning });
             } catch (error) {
                 console.error(`Failed processing ${file.name}:`, error);
-                results.push({ name: file.name, ok: false, error: error.message });
+                results.push({ name: file.name, ok: false, warning: shortError(error) });
                 await closeActiveDocumentNoSave().catch(closeError => console.warn("Close after failure failed:", closeError));
             }
         }
@@ -126,7 +139,7 @@ async function processFolder() {
         showBatchSummary(results);
     } catch (error) {
         console.error("Batch processing failed:", error);
-        showError("Batch failed: " + error.message);
+        showError("Batch failed: " + shortError(error));
     } finally {
         processButton.disabled = false;
         cancelButton.disabled = true;
@@ -134,27 +147,41 @@ async function processFolder() {
 }
 
 async function processOneFile(file, styleName, current, total) {
+    const warnings = [];
+
     await openFile(file);
     await sleep(700);
 
     updateProgress(current - 0.75, total, `Selecting subject in ${file.name}...`);
-    await selectSubject();
+    try {
+        await selectSubject();
+    } catch (error) {
+        warnings.push("Select Subject failed");
+        console.warn(`Select Subject failed for ${file.name}:`, error);
+    }
     await sleep(300);
 
     updateProgress(current - 0.5, total, `Applying Style Transfer (${styleName}) to ${file.name}...`);
-    await applyStyleTransfer(styleName);
-    await sleep(1200);
+    try {
+        await applyStyleTransfer(styleName);
+    } catch (error) {
+        warnings.push(shortError(error));
+        console.warn(`Style Transfer skipped for ${file.name}:`, error);
+    }
+    await sleep(500);
 
     updateProgress(current - 0.25, total, `Saving ${file.name}...`);
     await saveActiveDocumentAsPng(outputFolder, makeOutputName(file.name));
     await closeActiveDocumentNoSave();
+
+    return warnings.join("; ");
 }
 
 async function getImageFiles(folder) {
     const entries = await folder.getEntries();
     return entries
-        .filter(entry => entry.isFile && SUPPORTED_IMAGE_EXTENSIONS.has(getExtension(entry.name)))
-        .sort((a, b) => a.name.localeCompare(b.name));
+        .filter(entry => entry && entry.isFile && SUPPORTED_IMAGE_EXTENSIONS.has(getExtension(entry.name || "")))
+        .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
 }
 
 async function openFile(file) {
@@ -188,7 +215,7 @@ async function selectSubject() {
         }
     }
 
-    throw new Error("Select Subject failed. Run Select > Subject once manually and capture the batchPlay command if this Photoshop version uses a different descriptor. Last error: " + (lastError ? lastError.message : "unknown"));
+    throw new Error("Select Subject failed: " + (lastError ? lastError.message : "unknown"));
 }
 
 async function applyStyleTransfer(styleName) {
@@ -203,12 +230,7 @@ function buildStyleTransferDescriptor(styleName) {
         return tuneDescriptorForStyle(executableDescriptor, styleName);
     }
 
-    const metadata = getStyleMetadata(styleName);
-    throw new Error([
-        `No executable Style Transfer batchPlay descriptor was found in ${DESCRIPTOR_JSON_PATH}.`,
-        `The JSON confirms Style Transfer metadata (${metadata.id || "internal.StyleTransfer"}, style=${metadata.style || styleName}), but Photoshop needs the full neuralGalleryFilters payload.`,
-        "Paste/export a captured descriptor object containing _obj, NF_SPL_GRAPH, NF_UI_DATA, NF_SPL_REGISTERED_VARIABLES, NF_SPL_REGISTERED_VAR_NAMES, and NF_SPL_REGISTERED_VAR_CONFIGS into parsed_neural_output.json."
-    ].join(" "));
+    throw new Error(`No executable Style Transfer descriptor found. Saved fallback output instead. Need full neuralGalleryFilters payload for style ${styleName}.`);
 }
 
 async function loadDescriptorData() {
@@ -216,14 +238,21 @@ async function loadDescriptorData() {
         return descriptorCache;
     }
 
-    const response = await fetch(DESCRIPTOR_JSON_PATH);
-    if (!response.ok) {
-        throw new Error(`Could not load ${DESCRIPTOR_JSON_PATH}. Make sure it is in the plugin root.`);
+    try {
+        const response = await fetch(DESCRIPTOR_JSON_PATH);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        descriptorCache = await response.json();
+        descriptorLoadWarning = null;
+        console.log("Loaded Style Transfer descriptor data", descriptorCache);
+        return descriptorCache;
+    } catch (error) {
+        descriptorCache = {};
+        descriptorLoadWarning = `Could not load ${DESCRIPTOR_JSON_PATH}: ${error.message}`;
+        console.warn(descriptorLoadWarning);
+        return descriptorCache;
     }
-
-    descriptorCache = await response.json();
-    console.log("Loaded Style Transfer descriptor data", descriptorCache);
-    return descriptorCache;
 }
 
 function findExecutableDescriptor(styleName) {
@@ -260,29 +289,30 @@ function validateExecutableStyleTransferDescriptor(descriptor) {
     const requiredKeys = ["_obj", "NF_SPL_GRAPH", "NF_UI_DATA"];
     const missing = requiredKeys.filter(key => !descriptor || !descriptor[key]);
     if (missing.length > 0) {
-        throw new Error("Style Transfer descriptor is missing required keys: " + missing.join(", "));
+        throw new Error("Style Transfer descriptor missing: " + missing.join(", "));
     }
     if (descriptor._obj !== "neuralGalleryFilters") {
-        throw new Error("Style Transfer descriptor must have _obj: neuralGalleryFilters.");
+        throw new Error("Style Transfer descriptor must use _obj: neuralGalleryFilters.");
     }
 }
 
 function tuneDescriptorForStyle(descriptor, styleName) {
     const aliases = STYLE_ALIASES[styleName] || [styleName];
     const preferredModel = aliases[0];
+    const uiStyle = styleName === "wave_2048" || styleName === "wave_1024" ? "wave" : styleName;
 
     walkObject(descriptor, value => {
         if (!value || typeof value !== "object" || Array.isArray(value)) {
             return;
         }
 
-        setIfPresent(value, "spl::style", styleName === "wave_2048" || styleName === "wave_1024" ? "wave" : styleName);
-        setIfPresent(value, "style", styleName === "wave_2048" || styleName === "wave_1024" ? "wave" : styleName);
+        setIfPresent(value, "spl::style", uiStyle);
+        setIfPresent(value, "style", uiStyle);
 
-        if (value["spl::modelID"] && typeof value["spl::modelID"] === "string") {
+        if (typeof value["spl::modelID"] === "string") {
             value["spl::modelID"] = preferredModel;
         }
-        if (value.modelID && typeof value.modelID === "string") {
+        if (typeof value.modelID === "string") {
             value.modelID = preferredModel;
         }
         if (value["spl::value"] && aliases.some(alias => String(value["spl::value"]).includes(alias))) {
@@ -291,32 +321,6 @@ function tuneDescriptorForStyle(descriptor, styleName) {
     });
 
     return descriptor;
-}
-
-function getStyleMetadata(styleName) {
-    const metadata = {
-        id: "internal.StyleTransfer",
-        operation: "STYLE_TRANSFER",
-        styleTransferOption: "style_transfer",
-        style: styleName
-    };
-
-    walkObject(descriptorCache, value => {
-        if (typeof value !== "string") {
-            return;
-        }
-        if (value === "internal.StyleTransfer") {
-            metadata.id = value;
-        } else if (value === "STYLE_TRANSFER") {
-            metadata.operation = value;
-        } else if (value === "style_transfer") {
-            metadata.styleTransferOption = value;
-        } else if ((STYLE_ALIASES[styleName] || [styleName]).includes(value)) {
-            metadata.style = value;
-        }
-    });
-
-    return metadata;
 }
 
 function descriptorMentionsStyle(descriptor, styleName) {
@@ -391,7 +395,14 @@ function setIfPresent(object, key, value) {
 }
 
 function walkObject(value, visitor, seen = new Set()) {
-    if (!value || typeof value !== "object" || seen.has(value)) {
+    if (value === null || value === undefined) {
+        return;
+    }
+    if (typeof value !== "object") {
+        visitor(value);
+        return;
+    }
+    if (seen.has(value)) {
         return;
     }
 
@@ -399,24 +410,11 @@ function walkObject(value, visitor, seen = new Set()) {
     visitor(value);
 
     if (Array.isArray(value)) {
-        for (const item of value) {
-            if (item && typeof item === "object") {
-                walkObject(item, visitor, seen);
-            } else {
-                visitor(item);
-            }
-        }
+        value.forEach(item => walkObject(item, visitor, seen));
         return;
     }
 
-    for (const key of Object.keys(value)) {
-        const child = value[key];
-        if (child && typeof child === "object") {
-            walkObject(child, visitor, seen);
-        } else {
-            visitor(child);
-        }
-    }
+    Object.keys(value).forEach(key => walkObject(value[key], visitor, seen));
 }
 
 function deepClone(value) {
@@ -443,12 +441,22 @@ function sanitizeFilename(name) {
 
 function updateProgress(current, total, message) {
     const percentage = total <= 0 ? 0 : Math.max(0, Math.min(100, (current / total) * 100));
-    document.getElementById("progress-fill").style.width = percentage + "%";
+    const progressFill = document.getElementById("progress-fill");
+    if (progressFill) {
+        progressFill.style.width = percentage + "%";
+    }
     updateProgressText(message);
 }
 
 function updateProgressText(message) {
-    document.getElementById("status-text").textContent = message;
+    setText("status-text", message);
+}
+
+function setText(id, message) {
+    const element = document.getElementById(id);
+    if (element) {
+        element.textContent = message;
+    }
 }
 
 function showProgress() {
@@ -479,12 +487,22 @@ function showError(message) {
 
 function showBatchSummary(results) {
     const successes = results.filter(result => result.ok).length;
-    const failures = results.filter(result => !result.ok);
-    const failureText = failures.length > 0
-        ? " Failed: " + failures.map(result => `${result.name} (${result.error})`).join("; ")
+    const failures = results.filter(result => !result.ok).length;
+    const warnings = results.filter(result => result.warning).slice(0, 5);
+    const warningText = warnings.length > 0
+        ? " Warnings: " + warnings.map(result => `${result.name}: ${result.warning}`).join("; ")
         : "";
+    const loadText = descriptorLoadWarning ? " " + descriptorLoadWarning : "";
 
-    showResult(`Batch complete. Saved ${successes} file(s) to ${outputFolder.name}.${failureText}`);
+    showResult(`Batch complete. Saved ${successes} file(s) to ${outputFolder.name}. Failed ${failures}.${loadText}${warningText}`);
+}
+
+function shortError(error) {
+    const message = error && error.message ? error.message : String(error);
+    if (message.includes("No executable Style Transfer")) {
+        return "No executable Style Transfer descriptor; fallback PNG saved";
+    }
+    return message.length > 180 ? message.slice(0, 177) + "..." : message;
 }
 
 function sleep(ms) {

@@ -19,13 +19,13 @@
 
         <div class="section">
             <label>Input Folder:</label>
-            <sp-button id="select-input-folder-btn" variant="primary">Choose Input Folder</sp-button>
+            <button id="select-input-folder-btn" class="primary-button" type="button">Choose Input Folder</button>
             <p id="input-folder-name" class="file-name">No input folder selected</p>
         </div>
 
         <div class="section">
             <label>Output Folder:</label>
-            <sp-button id="select-output-folder-btn" variant="primary">Choose Output Folder</sp-button>
+            <button id="select-output-folder-btn" class="primary-button" type="button">Choose Output Folder</button>
             <p id="output-folder-name" class="file-name">No output folder selected</p>
         </div>
 
@@ -39,12 +39,12 @@
                     <option value="wave_1024">wave_1024</option>
                 </select>
             </div>
-            <p class="hint">Outputs are saved as PNG files using the source base filename.</p>
+            <p class="hint">Outputs are saved as PNG files using the source base filename. If the Neural Filter descriptor is not executable, the plugin saves a fallback output and reports a warning.</p>
         </div>
 
         <div class="section">
-            <sp-button id="process-folder-btn" variant="cta">Process Folder</sp-button>
-            <sp-button id="cancel-btn" variant="secondary" disabled>Cancel After Current Image</sp-button>
+            <button id="process-folder-btn" class="cta-button" type="button">Process Folder</button>
+            <button id="cancel-btn" class="secondary-button" type="button" disabled>Cancel After Current Image</button>
         </div>
 
         <div id="progress-section" class="section hidden">
